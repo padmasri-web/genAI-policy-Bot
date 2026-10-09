@@ -106,7 +106,7 @@ def query_rag_backend(question: str) -> Dict[str, Any]:
         resp = requests.post(
             f"{BACKEND_URL}/chat",
             json={"question": question},
-            timeout=45
+            timeout=90
         )
         if resp.status_code == 200:
             return {"success": True, "data": resp.json()}

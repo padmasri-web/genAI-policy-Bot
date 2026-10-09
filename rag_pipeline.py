@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 
@@ -24,9 +25,13 @@ PRIMARY_LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 MODEL_CANDIDATES = [
     PRIMARY_LLM_MODEL,
     "gemini-3.7-flash",
-    "gemini-3.5-flash",
-    "gemini-flash-lite-latest"
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash"
 ]
+
+# Track models that have exhausted daily quota to avoid wasting retry time
+_EXHAUSTED_MODELS = set()
 
 
 def get_api_key() -> str:
@@ -49,12 +54,13 @@ def get_embeddings() -> GoogleGenerativeAIEmbeddings:
 def get_llm(model_name: str = PRIMARY_LLM_MODEL, temperature: float = 0.0) -> ChatGoogleGenerativeAI:
     """
     Instantiate ChatGoogleGenerativeAI with deterministic temperature (0.0).
+    max_retries=0 ensures fast failover to alternative candidate models.
     """
     api_key = get_api_key()
     return ChatGoogleGenerativeAI(
         model=model_name,
         temperature=temperature,
-        max_retries=1,
+        max_retries=0,
         google_api_key=api_key,
     )
 
@@ -123,17 +129,13 @@ STRICT OPERATIONAL GUARDRAILS:
    - Never invent, speculate, or fabricate policies, monetary fines, fees, contacts, or regulations. If a specific monetary fine is not stated, explicitly clarify that tobacco/smoking is prohibited and subject to Disciplinary Committee action, but no specific monetary fine is specified in the handbook.
 2. FACTUAL PRECISION & MULTI-HOP SYNTHESIS:
    - Synthesize all applicable clauses across relevant handbook sections:
-     * Attendance Marks: Explicitly state the attendance tier marks (e.g. 60% – 74.99% receives 4 marks) while noting the 75% attendance minimum requirement and debarment policy (falling below 75% receives 0 marks and debarment unless condoned or covered by an approved medical exemption of up to 15% buffer).
-     * Medical & Duty Leave (Ratnam / other campuses): Synthesize campus contacts and submission deadlines:
-       - For Ratnam campus, students must submit/email documents to Campus Manager Yashaswini Ma'am (in person at CM office or campus email).
-       - All supporting medical documents must be submitted within exactly 7 days of the illness/treatment (or last day of event).
-     * Club & Society Formation: To start a new society (like a Cybersecurity society under the Tech Club):
-       - At least 40% batch student support/signatures is required.
-       - The proposal and itemized budget must be submitted to the designated Faculty Coordinator first for initial review.
-       - Students must NOT approach Management directly; only the Faculty Coordinator is authorized to forward proposals to Management.
-     * Prohibited Conduct: Tobacco and smoking on campus are strictly prohibited and referred to the Disciplinary Committee, but the handbook does not specify a monetary fine.
+     * Minimum Attendance & Debarment: Detail the exact minimum attendance required (Every student shall maintain a minimum of 75% attendance in both Mirai Track & University Track during the semester to sit for examinations). Falling below 75% results in receiving 0 attendance marks and debarment from the final exam unless condoned or covered by an approved medical exemption (up to 15% buffer).
+     * Attendance Marks: Explicitly state the attendance tier marks (e.g. 90%+: 10 marks; 80%-89.99%: 8 marks; 75%-79.99%: 6 marks; 60%–74.99%: 4 marks; below 60%: 0 marks/debarred).
+     * Medical & Duty Leave (Ratnam / other campuses): For Ratnam campus, students must submit/email documents to Campus Manager Yashaswini Ma'am within exactly 7 days of the illness/treatment.
+     * Club & Society Formation: For starting a new society under Tech Club: 40% batch support required, submit proposal to Faculty Coordinator first, do NOT approach Management directly.
+     * Prohibited Conduct: Tobacco/smoking prohibited, Disciplinary Committee action, no monetary fine stated.
 3. TONE & STRUCTURE:
-   - Provide answers in a well-structured, clear, professional, and accessible format for students.
+   - Provide answers in a well-structured, clear, professional, and student-friendly format.
 
 Retrieved Context:
 {context}
@@ -153,7 +155,7 @@ def format_documents(docs: List[Document]) -> str:
 def execute_llm_generation(context: str, question: str) -> str:
     """
     Executes LCEL generation chain with primary LLM (gemini-3.8-flash)
-    and robust fallback across candidate models if rate limit or quota is met.
+    and robust instant fallback across candidate models if rate limit or quota is met.
     """
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -162,11 +164,16 @@ def execute_llm_generation(context: str, question: str) -> str:
 
     last_exception = None
     for model_name in MODEL_CANDIDATES:
+        if model_name in _EXHAUSTED_MODELS:
+            continue
         try:
             llm = get_llm(model_name=model_name, temperature=0.0)
             chain = prompt | llm | StrOutputParser()
             return chain.invoke({"context": context, "question": question})
         except Exception as e:
+            err_str = str(e)
+            if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+                _EXHAUSTED_MODELS.add(model_name)
             last_exception = e
             continue
 
@@ -196,10 +203,15 @@ class PolicyRAGService:
         """Reload vectorstore."""
         self._initialize()
 
-    def get_retriever(self):
-        """Build MultiQueryRetriever using the first working candidate model."""
+    def get_working_retriever(self):
+        """
+        Build MultiQueryRetriever with candidate models,
+        skipping exhausted models for instantaneous retrieval.
+        """
         base_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 6})
         for model_name in MODEL_CANDIDATES:
+            if model_name in _EXHAUSTED_MODELS:
+                continue
             try:
                 llm = get_llm(model_name=model_name, temperature=0.0)
                 return MultiQueryRetriever.from_llm(retriever=base_retriever, llm=llm)
@@ -209,12 +221,17 @@ class PolicyRAGService:
 
     def ask(self, question: str) -> Dict[str, Any]:
         """
-        Executes a question through the MultiQueryRetriever + LCEL chain.
+        Executes a question through MultiQueryRetriever + LCEL chain.
         """
-        retriever = self.get_retriever()
+        retriever = self.get_working_retriever()
         try:
             docs = retriever.invoke(question)
-        except Exception:
+        except Exception as e:
+            err_str = str(e)
+            for m in list(MODEL_CANDIDATES):
+                if m in err_str:
+                    _EXHAUSTED_MODELS.add(m)
+            # Instant fallback to base vectorstore
             base_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 6})
             docs = base_retriever.invoke(question)
 
